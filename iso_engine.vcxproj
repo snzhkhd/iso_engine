@@ -149,14 +149,16 @@
   <ItemGroup>
     <ClInclude Include="editor\editor_ui.h" />
     <ClInclude Include="editor\entity_layer.h" />
-    <ClInclude Include="editor\map_file.h" />
     <ClInclude Include="editor\tile_catalog.h" />
     <ClInclude Include="iso\camera.h" />
+    <ClInclude Include="iso\chunk.h" />
     <ClInclude Include="iso\collision.h" />
     <ClInclude Include="iso\core.h" />
+    <ClInclude Include="iso\entity.h" />
     <ClInclude Include="iso\iso.h" />
     <ClInclude Include="iso\iso_raylib.h" />
     <ClInclude Include="iso\map.h" />
+    <ClInclude Include="iso\map_format.h" />
     <ClInclude Include="iso\zsort.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

@@ -53,14 +53,20 @@
     <ClInclude Include="editor\editor_ui.h">
       <Filter>Файлы заголовков\editor</Filter>
     </ClInclude>
-    <ClInclude Include="editor\map_file.h">
-      <Filter>Файлы заголовков\editor</Filter>
-    </ClInclude>
     <ClInclude Include="editor\tile_catalog.h">
       <Filter>Файлы заголовков\editor</Filter>
     </ClInclude>
     <ClInclude Include="editor\entity_layer.h">
       <Filter>Файлы заголовков\editor</Filter>
+    </ClInclude>
+    <ClInclude Include="iso\chunk.h">
+      <Filter>Файлы заголовков\iso_engine</Filter>
+    </ClInclude>
+    <ClInclude Include="iso\entity.h">
+      <Filter>Файлы заголовков\iso_engine</Filter>
+    </ClInclude>
+    <ClInclude Include="iso\map_format.h">
+      <Filter>Файлы заголовков\iso_engine</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>

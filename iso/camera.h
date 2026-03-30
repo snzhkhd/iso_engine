@@ -179,7 +179,7 @@ private:
     const IsoConfig* cfg_ = nullptr;
     Vec3  target_     = {};
     float zoom_       = 1.0f;
-    float min_zoom_   = 0.25f;
+    float min_zoom_   = 0.01f;
     float max_zoom_   = 4.0f;
     int   viewport_w_ = 1920;
     int   viewport_h_ = 1080;

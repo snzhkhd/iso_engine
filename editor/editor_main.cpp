@@ -24,7 +24,7 @@
 #include "raylib.h"
 #include "..//iso/iso_raylib.h"
 #include "tile_catalog.h"
-#include "map_file.h"
+
 #include "editor_ui.h"
 #include "entity_layer.h"
 
@@ -33,8 +33,10 @@
 #include <cstdio>
 #include <algorithm>
 #include <deque>
-
+#include <unordered_set>
 // ─── Constants ────────────────────────────────
+
+static constexpr int MAX_FILL = 4096;
 
 static constexpr int SCREEN_W = 1600;
 static constexpr int SCREEN_H = 900;
@@ -61,11 +63,19 @@ static const char* category_filter_names[] = {"All", "Ground", "Wall", "Cube", "
 
 // ─── Undo entry ───────────────────────────────
 
-struct UndoEntry {
+struct UndoEntry 
+{
+    bool is_entity = false;
+
     iso::TileCoord coord;
     iso::LayerType layer;
     iso::TileData  old_data;
     iso::TileData  new_data;
+
+    // Entity undo
+    enum class EntityAction : uint8_t { Add, Remove, Modify };
+    EntityAction   entity_action = EntityAction::Add;
+    iso::MapEntity entity_data{};
 };
 
 struct UndoGroup {
@@ -76,7 +86,8 @@ struct UndoGroup {
 
 struct EditorState {
     // Map
-    iso::IsoMap    map;
+    iso::ChunkMap map;
+
     iso::IsoConfig config;
 
     // Camera
@@ -97,7 +108,7 @@ struct EditorState {
 
     uint32_t selected_entity_id = 0;  // 0 = ничего не выбрано
 
-    iso_ed::EntityLayer entities;
+    
     bool  entity_mode = false;  // клавиша O — переключает режим "объекты"
     float snap_size = 0.25f;  // snap шаг (0.25 = четверть тайла)
 
@@ -109,6 +120,8 @@ struct EditorState {
 
     // Palette scroll
     iso_ed::ui::ScrollState palette_scroll;
+
+    bool show_all_opaque = false;  // V — все этажи видны на 100%
 
     // Rect fill state
     bool         rect_dragging = false;
@@ -139,10 +152,15 @@ struct EditorState {
 
 // ─── Undo system ──────────────────────────────
 
-static void push_undo(EditorState& ed, iso::TileCoord coord, iso::LayerType layer,
-                       iso::TileData old_data, iso::TileData new_data)
+static void push_undo(EditorState& ed, iso::TileCoord coord, iso::LayerType layer,iso::TileData old_data, iso::TileData new_data)
 {
-    ed.current_undo_group.entries.push_back({coord, layer, old_data, new_data});
+    UndoEntry e;
+    e.is_entity = false;
+    e.coord = coord;
+    e.layer = layer;
+    e.old_data = old_data;
+    e.new_data = new_data;
+    ed.current_undo_group.entries.push_back(e);
 }
 
 static void commit_undo(EditorState& ed) {
@@ -159,7 +177,24 @@ static void do_undo(EditorState& ed) {
     if (ed.undo_stack.empty()) return;
     auto& group = ed.undo_stack.back();
     for (auto& e : group.entries) {
-        ed.map.set_tile(e.layer, e.coord, e.old_data);
+        if (!e.is_entity) {
+            ed.map.set_tile(e.layer, e.coord, e.old_data);
+        }
+        else {
+            switch (e.entity_action) {
+            case UndoEntry::EntityAction::Add:
+                ed.map.entities().remove(e.entity_data.id);
+                break;
+            case UndoEntry::EntityAction::Remove:
+                ed.map.entities().all().push_back(e.entity_data);
+                break;
+            case UndoEntry::EntityAction::Modify:
+                for (auto& ent : ed.map.entities().all()) {
+                    if (ent.id == e.entity_data.id) { ent = e.entity_data; break; }
+                }
+                break;
+            }
+        }
     }
     ed.redo_stack.push_back(std::move(group));
     ed.undo_stack.pop_back();
@@ -170,13 +205,53 @@ static void do_redo(EditorState& ed) {
     if (ed.redo_stack.empty()) return;
     auto& group = ed.redo_stack.back();
     for (auto& e : group.entries) {
-        ed.map.set_tile(e.layer, e.coord, e.new_data);
+        if (!e.is_entity) {
+            ed.map.set_tile(e.layer, e.coord, e.new_data);
+        }
+        else {
+            switch (e.entity_action) {
+            case UndoEntry::EntityAction::Add:
+                ed.map.entities().all().push_back(e.entity_data);
+                break;
+            case UndoEntry::EntityAction::Remove:
+                ed.map.entities().remove(e.entity_data.id);
+                break;
+            case UndoEntry::EntityAction::Modify:
+                for (auto& ent : ed.map.entities().all()) {
+                    if (ent.id == e.entity_data.id) { ent = e.entity_data; break; }
+                }
+                break;
+            }
+        }
     }
     ed.undo_stack.push_back(std::move(group));
     ed.redo_stack.pop_back();
     ed.status.set("Redo", iso_ed::ui::theme.warning);
 }
 
+static void push_entity_add(EditorState& ed, const iso::MapEntity& ent) {
+    UndoEntry e;
+    e.is_entity = true;
+    e.entity_action = UndoEntry::EntityAction::Add;
+    e.entity_data = ent;
+    ed.current_undo_group.entries.push_back(e);
+}
+
+static void push_entity_remove(EditorState& ed, const iso::MapEntity& ent) {
+    UndoEntry e;
+    e.is_entity = true;
+    e.entity_action = UndoEntry::EntityAction::Remove;
+    e.entity_data = ent;
+    ed.current_undo_group.entries.push_back(e);
+}
+
+static void push_entity_modify(EditorState& ed, const iso::MapEntity& old_ent) {
+    UndoEntry e;
+    e.is_entity = true;
+    e.entity_action = UndoEntry::EntityAction::Modify;
+    e.entity_data = old_ent;  // save old state
+    ed.current_undo_group.entries.push_back(e);
+}
 // ─── Tile placement ───────────────────────────
 
 static iso::TileFlags build_flags(const EditorState& ed) {
@@ -220,33 +295,45 @@ static void erase_tile(EditorState& ed, iso::TileCoord tc) {
 static void flood_fill(EditorState& ed, iso::TileCoord start) {
     auto layer = static_cast<iso::LayerType>(ed.current_layer);
     auto target = ed.map.tile(layer, start);
-    if (target.tile_id == ed.selected_tile_id) return; // already same
+    if (target.tile_id == ed.selected_tile_id) return;
 
-    // BFS fill
+    static constexpr int MAX_FILL = 4096; // safety limit
+
     std::vector<iso::TileCoord> queue;
     queue.push_back(start);
 
-    std::vector<std::vector<bool>> visited(ed.map.rows(), std::vector<bool>(ed.map.cols(), false));
-    if (!ed.map.has_floor(start.floor)) return;
+    // Use a set for visited (no fixed bounds with chunks)
+    struct CoordHash {
+        size_t operator()(iso::TileCoord tc) const {
+            return std::hash<uint64_t>{}(
+                (uint64_t)(uint32_t)tc.col << 32 | (uint32_t)tc.row);
+        }
+    };
+    struct CoordEq {
+        bool operator()(iso::TileCoord a, iso::TileCoord b) const {
+            return a.col == b.col && a.row == b.row;
+        }
+    };
+    std::unordered_set<iso::TileCoord, CoordHash, CoordEq> visited;
 
-    while (!queue.empty()) {
+    int filled = 0;
+    while (!queue.empty() && filled < MAX_FILL) {
         auto tc = queue.back();
         queue.pop_back();
 
-        if (tc.col < 0 || tc.col >= ed.map.cols() ||
-            tc.row < 0 || tc.row >= ed.map.rows()) continue;
-        if (visited[tc.row][tc.col]) continue;
-        visited[tc.row][tc.col] = true;
+        if (visited.count(tc)) continue;
+        visited.insert(tc);
 
         auto cur = ed.map.tile(layer, tc);
         if (cur.tile_id != target.tile_id || cur.flags != target.flags) continue;
 
         place_tile(ed, tc);
+        filled++;
 
-        queue.push_back({tc.col + 1, tc.row, tc.floor});
-        queue.push_back({tc.col - 1, tc.row, tc.floor});
-        queue.push_back({tc.col, tc.row + 1, tc.floor});
-        queue.push_back({tc.col, tc.row - 1, tc.floor});
+        queue.push_back({ tc.col + 1, tc.row, tc.floor });
+        queue.push_back({ tc.col - 1, tc.row, tc.floor });
+        queue.push_back({ tc.col, tc.row + 1, tc.floor });
+        queue.push_back({ tc.col, tc.row - 1, tc.floor });
     }
 }
 
@@ -520,96 +607,119 @@ static void draw_statusbar(EditorState& ed, iso::TileCoord hover_tile) {
     }
     if (ed.entity_mode)
         draw_label("ENTITY[O]", (int)x + 120, SCREEN_H - 20, 12, iso_ed::ui::theme.accent);
+
+    if (ed.show_all_opaque)
+        draw_label("ALL[V]", (int)(x + 180), SCREEN_H - 20, 12, iso_ed::ui::theme.accent);
+
+
+    auto [bmin, bmax] = ed.map.bounds();
+    DrawText(TextFormat("Map: %d×%d  Chunks: %d",
+        bmax.col - bmin.col + 1, bmax.row - bmin.row + 1, ed.map.chunk_count()),
+        (int)(x + 100), SCREEN_H - 20, 12, theme.text_dim);
 }
 
 // ─── Map viewport rendering ──────────────────
 
 static void draw_map_viewport(EditorState& ed, iso::TileCoord hover_tile) {
     using namespace iso_ed::ui;
-
     float vp_x = PALETTE_WIDTH;
     float vp_w = SCREEN_W - PALETTE_WIDTH - (ed.show_props_panel ? PROPS_WIDTH : 0);
     float vp_y = TOOLBAR_HEIGHT;
     float vp_h = SCREEN_H - TOOLBAR_HEIGHT - STATUSBAR_HEIGHT;
 
- 
-
     BeginScissorMode((int)vp_x, (int)vp_y, (int)vp_w, (int)vp_h);
-
     const auto& cfg = ed.config;
 
-    // Determine visible range
     int draw_min_floor = cfg.min_floor;
-    int draw_max_floor = ed.current_floor;
+    int draw_max_floor = ed.show_all_opaque ? cfg.max_floor : ed.current_floor;
 
-    // ── Unified render: tiles + entities sorted together ──
+    // Find visible tile range from camera
+    iso::Vec3 tl = ed.camera.screen_to_world({ vp_x, vp_y });
+    iso::Vec3 br = ed.camera.screen_to_world({ vp_x + vp_w, vp_y + vp_h });
+    iso::Vec3 tr = ed.camera.screen_to_world({ vp_x + vp_w, vp_y });
+    iso::Vec3 bl = ed.camera.screen_to_world({ vp_x, vp_y + vp_h });
+    // Generous padding
+    int vis_col_min = (int)std::floor(std::min({ tl.x, br.x, tr.x, bl.x })) - 4;
+    int vis_col_max = (int)std::ceil(std::max({ tl.x, br.x, tr.x, bl.x })) + 4;
+    int vis_row_min = (int)std::floor(std::min({ tl.y, br.y, tr.y, bl.y })) - 4;
+    int vis_row_max = (int)std::ceil(std::max({ tl.y, br.y, tr.y, bl.y })) + 4;
+
+    auto [cmin, cmax] = iso::ChunkMap::chunk_range(
+        vis_col_min, vis_row_min, vis_col_max, vis_row_max);
+
     for (int f = draw_min_floor; f <= draw_max_floor; ++f) {
-        const iso::Floor* floor_ptr = ed.map.floor_safe(f);
-        if (!floor_ptr) continue;
-
-        float floor_alpha = (f < ed.current_floor) ? 0.3f : 1.0f;
+        float floor_alpha = (ed.show_all_opaque) ? 1.0f
+            : (f < ed.current_floor) ? 0.3f : 1.0f;
         unsigned char alpha = (unsigned char)(255 * floor_alpha);
 
-        // 1) Ground layer — always first, no sorting needed
-        for (int row = 0; row < floor_ptr->rows(); ++row) {
-            for (int col = 0; col < floor_ptr->cols(); ++col) {
-                const iso::TileData& td = floor_ptr->tile_safe(iso::LayerType::Ground, col, row);
-                if (td.is_empty()) continue;
+        // 1) Ground layer — always first
+        ed.map.for_each_chunk_in(cmin, cmax, [&](iso::ChunkCoord cc, const iso::Chunk& chunk) {
+            int ox = cc.origin_col();
+            int oy = cc.origin_row();
+            for (int lr = 0; lr < iso::CHUNK_SIZE; ++lr) {
+                for (int lc = 0; lc < iso::CHUNK_SIZE; ++lc) {
+                    const iso::TileData& td = chunk.tile_safe(
+                        iso::LayerType::Ground, lc, lr, f);
+                    if (td.is_empty()) continue;
 
-                iso::Vec3 world = iso::tile_to_world({ col, row, f }, cfg);
-                iso::Vec2 sp = ed.camera.world_to_screen(world);
-                if (sp.x < vp_x - 300 || sp.x > vp_x + vp_w + 300 ||
-                    sp.y < vp_y - 300 || sp.y > vp_y + vp_h + 300) continue;
+                    int col = ox + lc, row = oy + lr;
+                    iso::Vec3 world = iso::tile_to_world({ col, row, f }, cfg);
+                    iso::Vec2 sp = ed.camera.world_to_screen(world);
+                    if (sp.x < vp_x - 300 || sp.x > vp_x + vp_w + 300 ||
+                        sp.y < vp_y - 300 || sp.y > vp_y + vp_h + 300) continue;
 
-                const auto* te = ed.catalog.get(td.tile_id);
-                if (te && te->loaded) {
-                    float zoom = ed.camera.zoom();
-                    float tw = te->src_width * zoom;
-                    float th = te->src_height * zoom;
-                    Rectangle src = { 0, 0, (float)te->src_width, (float)te->src_height };
-                    Rectangle dst = { sp.x - tw * 0.5f, sp.y - th * 0.5f, tw, th };
-                    DrawTexturePro(te->texture, src, dst, { 0, 0 }, 0.f, { 255, 255, 255, alpha });
-                }
-                else {
-                    float hw = ed.camera.tile_draw_hw();
-                    float hh = ed.camera.tile_draw_hh();
-                    Color c = { 80, 140, 60, (unsigned char)(180 * floor_alpha) };
-                    Vector2 pts[4] = { {sp.x, sp.y - hh},{sp.x + hw, sp.y},{sp.x, sp.y + hh},{sp.x - hw, sp.y} };
-                    DrawTriangle(pts[0], pts[3], pts[2], c);
-                    DrawTriangle(pts[0], pts[2], pts[1], c);
+                    const auto* te = ed.catalog.get(td.tile_id);
+                    if (te && te->loaded) {
+                        float zoom = ed.camera.zoom();
+                        float tw = te->src_width * zoom;
+                        float th = te->src_height * zoom;
+                        Rectangle src = { 0, 0, (float)te->src_width, (float)te->src_height };
+                        Rectangle dst = { sp.x - tw * 0.5f, sp.y - th * 0.5f, tw, th };
+                        DrawTexturePro(te->texture, src, dst, { 0,0 }, 0.f, { 255,255,255,alpha });
+                    }
+                    else {
+                        float hw = ed.camera.tile_draw_hw();
+                        float hh = ed.camera.tile_draw_hh();
+                        Color c = { 80, 140, 60, (unsigned char)(180 * floor_alpha) };
+                        Vector2 pts[4] = { {sp.x,sp.y - hh},{sp.x + hw,sp.y},{sp.x,sp.y + hh},{sp.x - hw,sp.y} };
+                        DrawTriangle(pts[0], pts[3], pts[2], c);
+                        DrawTriangle(pts[0], pts[2], pts[1], c);
+                    }
                 }
             }
-        }
+            });
 
         // 2) Collect walls/objects/overlays + entities into one list
         struct DrawItem {
             float depth;
-            // Tile data
             bool is_entity;
             int col, row, layer;
-            // Entity data
-            const iso_ed::MapEntity* ent;
+            const iso::MapEntity* ent;   // ← iso:: not iso_ed::
         };
-
         std::vector<DrawItem> items;
 
-        // Add tile layers 1-3
-        for (int row = 0; row < floor_ptr->rows(); ++row) {
-            for (int col = 0; col < floor_ptr->cols(); ++col) {
-                for (int layer = 1; layer < iso::LAYER_COUNT; ++layer) {
-                    const iso::TileData& td = floor_ptr->tile_safe(
-                        static_cast<iso::LayerType>(layer), col, row);
-                    if (td.is_empty()) continue;
-                    items.push_back({
-                        (float)(col + row) + layer * 0.1f,  // sub-sort by layer
-                        false, col, row, layer, nullptr
-                        });
+        // Add tile layers 1-3 from visible chunks
+        ed.map.for_each_chunk_in(cmin, cmax, [&](iso::ChunkCoord cc, const iso::Chunk& chunk) {
+            int ox = cc.origin_col();
+            int oy = cc.origin_row();
+            for (int lr = 0; lr < iso::CHUNK_SIZE; ++lr) {
+                for (int lc = 0; lc < iso::CHUNK_SIZE; ++lc) {
+                    int col = ox + lc, row = oy + lr;
+                    for (int layer = 1; layer < iso::LAYER_COUNT; ++layer) {
+                        const iso::TileData& td = chunk.tile_safe(
+                            static_cast<iso::LayerType>(layer), lc, lr, f);
+                        if (td.is_empty()) continue;
+                        items.push_back({
+                            (float)(col + row) + layer * 0.1f,
+                            false, col, row, layer, nullptr
+                            });
+                    }
                 }
             }
-        }
+            });
 
-        // Add entities
-        for (auto& ent : ed.entities.all()) {
+        // Add entities on this floor
+        for (const auto& ent : ed.map.entities().all()) {
             if (ent.floor != f) continue;
             items.push_back({
                 ent.iso_depth(),
@@ -624,14 +734,14 @@ static void draw_map_viewport(EditorState& ed, iso::TileCoord hover_tile) {
         // 3) Draw sorted
         for (const auto& item : items) {
             if (!item.is_entity) {
-                // Tile
                 iso::Vec3 world = iso::tile_to_world({ item.col, item.row, f }, cfg);
                 iso::Vec2 sp = ed.camera.world_to_screen(world);
                 if (sp.x < vp_x - 300 || sp.x > vp_x + vp_w + 300 ||
                     sp.y < vp_y - 300 || sp.y > vp_y + vp_h + 300) continue;
 
-                const iso::TileData& td = floor_ptr->tile_safe(
-                    static_cast<iso::LayerType>(item.layer), item.col, item.row);
+                iso::TileData td = ed.map.tile(
+                    static_cast<iso::LayerType>(item.layer),
+                    { item.col, item.row, f });
                 const auto* te = ed.catalog.get(td.tile_id);
                 if (te && te->loaded) {
                     float zoom = ed.camera.zoom();
@@ -642,7 +752,7 @@ static void draw_map_viewport(EditorState& ed, iso::TileCoord hover_tile) {
                     float dy = sp.y + screen_hh - th;
                     Rectangle src = { 0, 0, (float)te->src_width, (float)te->src_height };
                     Rectangle dst = { dx, dy, tw, th };
-                    DrawTexturePro(te->texture, src, dst, { 0, 0 }, 0.f, { 255, 255, 255, alpha });
+                    DrawTexturePro(te->texture, src, dst, { 0,0 }, 0.f, { 255,255,255,alpha });
                 }
                 else {
                     float hw = ed.camera.tile_draw_hw();
@@ -656,7 +766,6 @@ static void draw_map_viewport(EditorState& ed, iso::TileCoord hover_tile) {
                 }
             }
             else {
-                // Entity
                 const auto* ent = item.ent;
                 const auto* te = ed.catalog.get(ent->tile_id);
                 if (!te || !te->loaded) continue;
@@ -674,7 +783,7 @@ static void draw_map_viewport(EditorState& ed, iso::TileCoord hover_tile) {
                 float dy = sp.y + screen_hh - th;
                 Rectangle src = { 0, 0, (float)te->src_width, (float)te->src_height };
                 Rectangle dst = { dx, dy, tw, th };
-                DrawTexturePro(te->texture, src, dst, { 0, 0 }, 0.f, { 255, 255, 255, alpha });
+                DrawTexturePro(te->texture, src, dst, { 0,0 }, 0.f, { 255,255,255,alpha });
 
                 if (ent->id == ed.selected_entity_id) {
                     DrawRectangleLinesEx(dst, 2.f, YELLOW);
@@ -685,16 +794,15 @@ static void draw_map_viewport(EditorState& ed, iso::TileCoord hover_tile) {
         }
     }
 
-    // Grid
+
+    // Grid — рисуем вокруг видимой области
     if (ed.show_grid) {
         iso::draw_tile_grid(ed.camera, cfg,
-                           0, 0, ed.map.cols() - 1, ed.map.rows() - 1,
-                           ed.current_floor, {60, 60, 80, 40});
+            vis_col_min, vis_row_min, vis_col_max, vis_row_max,
+            ed.current_floor, { 60, 60, 80, 40 });
     }
 
     // Hover highlight
-    if (hover_tile.col >= 0 && hover_tile.col < ed.map.cols() &&
-        hover_tile.row >= 0 && hover_tile.row < ed.map.rows())
     {
         Color highlight = {255, 255, 0, 50};
         if (ed.tool == Tool::Eraser) highlight = {255, 50, 50, 50};
@@ -810,30 +918,42 @@ static void handle_input(EditorState& ed, iso::TileCoord hover_tile)
     if (IsKeyPressed(KEY_THREE)) ed.current_layer = 2;
     if (IsKeyPressed(KEY_FOUR))  ed.current_layer = 3;
 
+    if (IsKeyPressed(KEY_V)) ed.show_all_opaque = !ed.show_all_opaque;
+
     if (IsKeyPressed(KEY_TAB)) ed.show_grid = !ed.show_grid;
     if (IsKeyPressed(KEY_G))   ed.show_ghost = !ed.show_ghost;
     if (IsKeyPressed(KEY_P))   ed.show_props_panel = !ed.show_props_panel;
 
-    if (IsKeyPressed(KEY_PAGE_UP))   ed.current_floor = std::min(ed.current_floor + 1, ed.config.max_floor);
-    if (IsKeyPressed(KEY_PAGE_DOWN)) ed.current_floor = std::max(ed.current_floor - 1, ed.config.min_floor);
+    if (!ctrl && IsKeyPressed(KEY_PAGE_UP))   ed.current_floor = std::min(ed.current_floor + 1, ed.config.max_floor);
+    if (!ctrl && IsKeyPressed(KEY_PAGE_DOWN)) ed.current_floor = std::max(ed.current_floor - 1, ed.config.min_floor);
 
     // Undo/Redo
     if (ctrl && IsKeyPressed(KEY_Z)) do_undo(ed);
     if (ctrl && IsKeyPressed(KEY_Y)) do_redo(ed);
 
+    if (ctrl && IsKeyPressed(KEY_PAGE_UP))
+    {
+        ed.config.height_pixel_offset += 4.0f;
+        printf("height_pixel_offset=%f\n", ed.config.height_pixel_offset);
+    }
+    if (ctrl && IsKeyPressed(KEY_PAGE_DOWN))
+    {
+        ed.config.height_pixel_offset -= 4.0f;
+        printf("height_pixel_offset=%f\n", ed.config.height_pixel_offset);
+    }
+
     // Save
     if (ctrl && IsKeyPressed(KEY_S)) 
     {
         if (ed.current_filepath.empty())
-            ed.current_filepath = "map.isom";
-        if (iso_ed::save_map(ed.map, ed.current_filepath)) 
-        {
-            std::string ent_path = ed.current_filepath + ".ent";
-            ed.entities.save(ent_path);
-
-            ed.status.set("Saved!", iso_ed::ui::theme.success);
+            ed.current_filepath = "map.isomap";  // новый формат
+        ed.map.prune_empty();  // убрать пустые чанки перед сохранением!
+        if (iso::save_isomap(ed.map, ed.current_filepath)) {
+            ed.status.set(TextFormat("Saved! (%d chunks)", ed.map.chunk_count()),
+                iso_ed::ui::theme.success);
             ed.modified = false;
-        } else {
+        }
+        else {
             ed.status.set("Save failed!", iso_ed::ui::theme.danger);
         }
     }
@@ -855,11 +975,6 @@ static void handle_input(EditorState& ed, iso::TileCoord hover_tile)
     bool lmb_down    = IsMouseButtonDown(MOUSE_BUTTON_LEFT);
     bool rmb_down    = IsMouseButtonDown(MOUSE_BUTTON_RIGHT);
 
-    // Bounds check
-    bool in_bounds = hover_tile.col >= 0 && hover_tile.col < ed.map.cols() &&
-                     hover_tile.row >= 0 && hover_tile.row < ed.map.rows();
-    if (!in_bounds) return;
-
     // ── Entity mode (free placement) ──────────
     if (ed.entity_mode && viewport_hover) 
     {
@@ -871,10 +986,9 @@ static void handle_input(EditorState& ed, iso::TileCoord hover_tile)
         float sy = std::round(world.y / ed.snap_size) * ed.snap_size;
 
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-            // Shift+LMB = select existing entity
             bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
             if (shift) {
-                auto* hit = ed.entities.pick(sx, sy, ed.current_floor, 0.6f);
+                auto* hit = ed.map.entities().pick(sx, sy, ed.current_floor, 0.6f);
                 if (hit) {
                     ed.selected_entity_id = hit->id;
                     ed.status.set(TextFormat("Selected entity #%d", hit->id),
@@ -885,8 +999,16 @@ static void handle_input(EditorState& ed, iso::TileCoord hover_tile)
                 }
             }
             else if (ed.selected_tile_id > 0) {
-                // Normal LMB = place
-                ed.entities.add((uint16_t)ed.selected_tile_id, sx, sy, ed.current_floor);
+                uint32_t new_id = ed.map.entities().add(
+                    (uint16_t)ed.selected_tile_id, sx, sy, ed.current_floor);
+                // Find the just-added entity for undo
+                for (const auto& ent : ed.map.entities().all()) {
+                    if (ent.id == new_id) {
+                        push_entity_add(ed, ent);
+                        break;
+                    }
+                }
+                commit_undo(ed);
                 ed.modified = true;
                 ed.status.set(TextFormat("Entity placed at %.2f, %.2f", sx, sy),
                     iso_ed::ui::theme.success);
@@ -894,10 +1016,12 @@ static void handle_input(EditorState& ed, iso::TileCoord hover_tile)
         }
 
         if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
-            auto* hit = ed.entities.pick(sx, sy, ed.current_floor, 0.6f);
+            auto* hit = ed.map.entities().pick(sx, sy, ed.current_floor, 0.6f);
             if (hit) {
+                push_entity_remove(ed, *hit);  // save before removing
                 if (hit->id == ed.selected_entity_id) ed.selected_entity_id = 0;
-                ed.entities.remove(hit->id);
+                ed.map.entities().remove(hit->id);
+                commit_undo(ed);
                 ed.modified = true;
                 ed.status.set("Entity removed", iso_ed::ui::theme.warning);
             }
@@ -905,20 +1029,22 @@ static void handle_input(EditorState& ed, iso::TileCoord hover_tile)
 
         // +/- adjust z_bias of selected entity
         if (ed.selected_entity_id != 0) {
-            iso_ed::MapEntity* sel = nullptr;
-            for (auto& e : ed.entities.all())
+            iso::MapEntity* sel = nullptr;
+            for (auto& e : ed.map.entities().all())
                 if (e.id == ed.selected_entity_id) { sel = &e; break; }
 
             if (sel) {
-                if (IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD)) {    // +
+                if (IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD)) {
+                    push_entity_modify(ed, *sel);  // save old state
                     sel->z_bias = std::min(sel->z_bias + 1, 10);
+                    commit_undo(ed);
                     ed.modified = true;
-                    ed.status.set(TextFormat("z_bias: %d", sel->z_bias), iso_ed::ui::theme.accent);
                 }
-                if (IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT)) { // -
+                if (IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT)) {
+                    push_entity_modify(ed, *sel);
                     sel->z_bias = std::max(sel->z_bias - 1, -10);
+                    commit_undo(ed);
                     ed.modified = true;
-                    ed.status.set(TextFormat("z_bias: %d", sel->z_bias), iso_ed::ui::theme.accent);
                 }
                 if (IsKeyPressed(KEY_ESCAPE)) {
                     ed.selected_entity_id = 0;
@@ -1021,28 +1147,20 @@ static void handle_file_drop(EditorState& ed) {
         std::string path = files.paths[i];
         std::string ext = GetFileExtension(path.c_str());
 
-        if (ext == ".isom") 
-        {
-            // Load map
-            if (iso_ed::load_map(ed.map, path)) 
-            {
+        if (ext == ".isomap") {
+            if (iso::load_isomap(ed.map, path)) {
                 ed.config = ed.map.config();
+                ed.camera.set_config(ed.config);
                 ed.current_filepath = path;
                 ed.modified = false;
                 ed.current_floor = 0;
                 ed.undo_stack.clear();
                 ed.redo_stack.clear();
-
-                std::string ent_path = path + ".ent";
-                ed.entities.load(ent_path);
-
-                ed.status.set("Map loaded!", iso_ed::ui::theme.success);
-            } 
-            else 
-            {
-                ed.status.set("Failed to load map!", iso_ed::ui::theme.danger);
+                ed.status.set(TextFormat("Loaded! (%d chunks)", ed.map.chunk_count()),
+                    iso_ed::ui::theme.success);
             }
-        } else if (ext == ".png" || ext == ".jpg" || ext == ".bmp") {
+        }
+        else if (ext == ".png" || ext == ".jpg" || ext == ".bmp") {
             // Add tile to catalog
             int id = ed.catalog.add_tile(path);
             if (id >= 0) {
@@ -1069,13 +1187,13 @@ int main(int argc, char* argv[]) {
     ed.config.tile_width       = 256;     // match your tileset dimensions!
     ed.config.tile_height      = 128;
     ed.config.floor_height     = 1.0f;
-    ed.config.height_pixel_offset = 64.0f;
+    ed.config.height_pixel_offset = 30.0f;
     ed.config.default_map_cols = 32;
     ed.config.default_map_rows = 32;
     ed.config.min_floor        = -1;
     ed.config.max_floor        = 4;
 
-    ed.map = iso::IsoMap(ed.config);
+    ed.map = iso::ChunkMap(ed.config);
     ed.camera = iso::IsoCamera(ed.config, SCREEN_W, SCREEN_H);
     ed.camera.set_position({16.f, 16.f, 0.f});
     ed.camera.set_zoom(0.25f);
