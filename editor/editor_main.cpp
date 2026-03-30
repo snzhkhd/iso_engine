@@ -123,6 +123,8 @@ struct EditorState {
 
     bool show_all_opaque = false;  // V — все этажи видны на 100%
 
+    bool show_minimap = false;  // M
+
     // Rect fill state
     bool         rect_dragging = false;
     iso::TileCoord rect_start{};
@@ -618,9 +620,100 @@ static void draw_statusbar(EditorState& ed, iso::TileCoord hover_tile) {
         (int)(x + 100), SCREEN_H - 20, 12, theme.text_dim);
 }
 
+static void draw_minimap(EditorState& ed) {
+    using namespace iso_ed::ui;
+    if (!ed.show_minimap) return;
+
+    const auto& cfg = ed.config;
+    auto [bmin, bmax] = ed.map.bounds();
+    int map_w = bmax.col - bmin.col + 1;
+    int map_h = bmax.row - bmin.row + 1;
+    if (map_w <= 0 || map_h <= 0) return;
+
+    // Minimap size and position (bottom-right corner)
+    float mm_max = 250.f;
+    float scale = std::min(mm_max / map_w, mm_max / map_h);
+    float mm_w = map_w * scale;
+    float mm_h = map_h * scale;
+    float mm_x = GetScreenWidth() - mm_w - 16 - (ed.show_props_panel ? PROPS_WIDTH : 0);
+    float mm_y = GetScreenHeight() - mm_h - STATUSBAR_HEIGHT - 16;
+
+    // Background
+    DrawRectangle((int)mm_x - 2, (int)mm_y - 2, (int)mm_w + 4, (int)mm_h + 4,
+        { 0, 0, 0, 180 });
+    DrawRectangleLinesEx({ mm_x - 2, mm_y - 2, mm_w + 4, mm_h + 4 }, 1.f,
+        theme.border);
+
+    // Draw chunks as colored blocks
+    ed.map.for_each_chunk([&](iso::ChunkCoord cc, const iso::Chunk& chunk) {
+        if (chunk.is_empty()) return;
+
+        float cx = mm_x + (cc.origin_col() - bmin.col) * scale;
+        float cy = mm_y + (cc.origin_row() - bmin.row) * scale;
+        float cw = iso::CHUNK_SIZE * scale;
+        float ch = iso::CHUNK_SIZE * scale;
+
+        // Count non-empty tiles for color intensity
+        int filled = 0;
+        for (int lr = 0; lr < iso::CHUNK_SIZE; ++lr)
+            for (int lc = 0; lc < iso::CHUNK_SIZE; ++lc) {
+                auto td = chunk.tile_safe(iso::LayerType::Ground, lc, lr, ed.current_floor);
+                if (!td.is_empty()) filled++;
+            }
+
+        float density = (float)filled / iso::CHUNK_TILE_COUNT;
+        unsigned char a = (unsigned char)(60 + 160 * density);
+
+        // Ground = green, walls present = brownish
+        bool has_walls = false;
+        for (int lr = 0; lr < iso::CHUNK_SIZE && !has_walls; ++lr)
+            for (int lc = 0; lc < iso::CHUNK_SIZE && !has_walls; ++lc) {
+                auto td = chunk.tile_safe(iso::LayerType::Wall, lc, lr, ed.current_floor);
+                if (!td.is_empty()) has_walls = true;
+            }
+
+        Color col = has_walls ? Color{ 160, 130, 90, a } : Color{ 70, 130, 60, a };
+        DrawRectangle((int)cx, (int)cy, (int)cw, (int)ch, col);
+        DrawRectangleLinesEx({ cx, cy, cw, ch }, 0.5f, { 100, 100, 120, 80 });
+        });
+
+    // Draw entities as dots
+    for (const auto& ent : ed.map.entities().all()) {
+        if (ent.floor != ed.current_floor) continue;
+        float ex = mm_x + (ent.x - bmin.col) * scale;
+        float ey = mm_y + (ent.y - bmin.row) * scale;
+        DrawCircle((int)ex, (int)ey, 2.f, { 255, 200, 50, 200 });
+    }
+
+    // Camera viewport indicator
+    iso::Vec3 cam_tl = ed.camera.screen_to_world({ (float)PALETTE_WIDTH, (float)TOOLBAR_HEIGHT });
+    iso::Vec3 cam_br = ed.camera.screen_to_world(
+        { (float)(GetScreenWidth() - (ed.show_props_panel ? PROPS_WIDTH : 0)),
+         (float)(GetScreenHeight() - STATUSBAR_HEIGHT) });
+
+    float vx = mm_x + (cam_tl.x - bmin.col) * scale;
+    float vy = mm_y + (cam_tl.y - bmin.row) * scale;
+    float vw = (cam_br.x - cam_tl.x) * scale;
+    float vh = (cam_br.y - cam_tl.y) * scale;
+    DrawRectangleLinesEx({ vx, vy, vw, vh }, 2.f, { 255, 255, 255, 200 });
+
+    // Click to teleport camera
+    Vector2 mp = GetMousePosition();
+    if (CheckCollisionPointRec(mp, { mm_x, mm_y, mm_w, mm_h })
+        && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+    {
+        float wx = bmin.col + (mp.x - mm_x) / scale;
+        float wy = bmin.row + (mp.y - mm_y) / scale;
+        ed.camera.set_position({ wx, wy, ed.current_floor * cfg.floor_height });
+    }
+
+    // Label
+    DrawText("MAP [M]", (int)mm_x, (int)mm_y - 14, 11, theme.text_dim);
+}
 // ─── Map viewport rendering ──────────────────
 
-static void draw_map_viewport(EditorState& ed, iso::TileCoord hover_tile) {
+static void draw_map_viewport(EditorState& ed, iso::TileCoord hover_tile) 
+{
     using namespace iso_ed::ui;
     float vp_x = PALETTE_WIDTH;
     float vp_w = SCREEN_W - PALETTE_WIDTH - (ed.show_props_panel ? PROPS_WIDTH : 0);
@@ -647,17 +740,28 @@ static void draw_map_viewport(EditorState& ed, iso::TileCoord hover_tile) {
     auto [cmin, cmax] = iso::ChunkMap::chunk_range(
         vis_col_min, vis_row_min, vis_col_max, vis_row_max);
 
-    for (int f = draw_min_floor; f <= draw_max_floor; ++f) {
+    //zoom
+    float zoom = ed.camera.zoom();
+    float min_tile_screen = cfg.tile_width * zoom;
+    bool skip_objects = min_tile_screen < 8.f;   // объекты < 8px — не рисовать
+    bool skip_walls = min_tile_screen < 4.f;    // стены < 4px — не рисовать
+    bool draw_simple = min_tile_screen < 16.f;   // < 16px — рисовать цветные ромбы вместо текстур
+
+    for (int f = draw_min_floor; f <= draw_max_floor; ++f) 
+    {
         float floor_alpha = (ed.show_all_opaque) ? 1.0f
             : (f < ed.current_floor) ? 0.3f : 1.0f;
         unsigned char alpha = (unsigned char)(255 * floor_alpha);
 
         // 1) Ground layer — always first
-        ed.map.for_each_chunk_in(cmin, cmax, [&](iso::ChunkCoord cc, const iso::Chunk& chunk) {
+        ed.map.for_each_chunk_in(cmin, cmax, [&](iso::ChunkCoord cc, const iso::Chunk& chunk) 
+            {
             int ox = cc.origin_col();
             int oy = cc.origin_row();
-            for (int lr = 0; lr < iso::CHUNK_SIZE; ++lr) {
-                for (int lc = 0; lc < iso::CHUNK_SIZE; ++lc) {
+            for (int lr = 0; lr < iso::CHUNK_SIZE; ++lr) 
+            {
+                for (int lc = 0; lc < iso::CHUNK_SIZE; ++lc) 
+                {
                     const iso::TileData& td = chunk.tile_safe(
                         iso::LayerType::Ground, lc, lr, f);
                     if (td.is_empty()) continue;
@@ -667,6 +771,18 @@ static void draw_map_viewport(EditorState& ed, iso::TileCoord hover_tile) {
                     iso::Vec2 sp = ed.camera.world_to_screen(world);
                     if (sp.x < vp_x - 300 || sp.x > vp_x + vp_w + 300 ||
                         sp.y < vp_y - 300 || sp.y > vp_y + vp_h + 300) continue;
+
+                    if (draw_simple) {
+                        // Дешёвый цветной ромб вместо текстуры
+                        float hw = cfg.tile_width * 0.5f * zoom;
+                        float hh = cfg.tile_height * 0.5f * zoom;
+                        Color c = { 80, 130, 60, alpha };  // simplified color
+                        Vector2 pts[4] = { {sp.x,sp.y - hh},{sp.x + hw,sp.y},{sp.x,sp.y + hh},{sp.x - hw,sp.y} };
+                        DrawTriangle(pts[0], pts[3], pts[2], c);
+                        DrawTriangle(pts[0], pts[2], pts[1], c);
+                        continue;  // skip texture draw
+                    }
+
 
                     const auto* te = ed.catalog.get(td.tile_id);
                     if (te && te->loaded) {
@@ -694,18 +810,33 @@ static void draw_map_viewport(EditorState& ed, iso::TileCoord hover_tile) {
             float depth;
             bool is_entity;
             int col, row, layer;
-            const iso::MapEntity* ent;   // ← iso:: not iso_ed::
+            const iso::MapEntity* ent;  
         };
         std::vector<DrawItem> items;
 
         // Add tile layers 1-3 from visible chunks
-        ed.map.for_each_chunk_in(cmin, cmax, [&](iso::ChunkCoord cc, const iso::Chunk& chunk) {
+        ed.map.for_each_chunk_in(cmin, cmax, [&](iso::ChunkCoord cc, const iso::Chunk& chunk) 
+            {
             int ox = cc.origin_col();
             int oy = cc.origin_row();
-            for (int lr = 0; lr < iso::CHUNK_SIZE; ++lr) {
-                for (int lc = 0; lc < iso::CHUNK_SIZE; ++lc) {
+
+            iso::Vec2 chunk_center = ed.camera.world_to_screen(
+                iso::tile_to_world({ ox + iso::CHUNK_SIZE / 2, oy + iso::CHUNK_SIZE / 2, f }, cfg));
+            float chunk_radius = iso::CHUNK_SIZE * cfg.tile_width * zoom;
+            if (chunk_center.x < vp_x - chunk_radius || chunk_center.x > vp_x + vp_w + chunk_radius ||
+                chunk_center.y < vp_y - chunk_radius || chunk_center.y > vp_y + vp_h + chunk_radius)
+                return;  // entire chunk off-screen
+
+            for (int lr = 0; lr < iso::CHUNK_SIZE; ++lr) 
+            {
+                for (int lc = 0; lc < iso::CHUNK_SIZE; ++lc) 
+                {
                     int col = ox + lc, row = oy + lr;
-                    for (int layer = 1; layer < iso::LAYER_COUNT; ++layer) {
+                    for (int layer = 1; layer < iso::LAYER_COUNT; ++layer) 
+                    {
+                        if (skip_objects && layer >= 2) continue;  // skip objects/overlay
+                        if (skip_walls && layer == 1) continue;   // skip walls
+
                         const iso::TileData& td = chunk.tile_safe(
                             static_cast<iso::LayerType>(layer), lc, lr, f);
                         if (td.is_empty()) continue;
@@ -718,14 +849,19 @@ static void draw_map_viewport(EditorState& ed, iso::TileCoord hover_tile) {
             }
             });
 
-        // Add entities on this floor
-        for (const auto& ent : ed.map.entities().all()) {
-            if (ent.floor != f) continue;
-            items.push_back({
-                ent.iso_depth(),
-                true, 0, 0, 0, &ent
-                });
+        
+        if (!skip_objects)
+        {
+            // Add entities on this floor
+            for (const auto& ent : ed.map.entities().all()) {
+                if (ent.floor != f) continue;
+                items.push_back({
+                    ent.iso_depth(),
+                    true, 0, 0, 0, &ent
+                    });
+            }
         }
+        
 
         // Sort by depth
         std::sort(items.begin(), items.end(),
@@ -919,10 +1055,12 @@ static void handle_input(EditorState& ed, iso::TileCoord hover_tile)
     if (IsKeyPressed(KEY_FOUR))  ed.current_layer = 3;
 
     if (IsKeyPressed(KEY_V)) ed.show_all_opaque = !ed.show_all_opaque;
+    if (IsKeyPressed(KEY_M)) ed.show_minimap = !ed.show_minimap;
 
     if (IsKeyPressed(KEY_TAB)) ed.show_grid = !ed.show_grid;
     if (IsKeyPressed(KEY_G))   ed.show_ghost = !ed.show_ghost;
     if (IsKeyPressed(KEY_P))   ed.show_props_panel = !ed.show_props_panel;
+
 
     if (!ctrl && IsKeyPressed(KEY_PAGE_UP))   ed.current_floor = std::min(ed.current_floor + 1, ed.config.max_floor);
     if (!ctrl && IsKeyPressed(KEY_PAGE_DOWN)) ed.current_floor = std::max(ed.current_floor - 1, ed.config.min_floor);
@@ -1241,6 +1379,7 @@ int main(int argc, char* argv[]) {
             draw_props_panel(ed);
         draw_statusbar(ed, hover_tile);
 
+        draw_minimap(ed);
         // FPS (debug)
         DrawFPS(SCREEN_W - 80, 4);
 
