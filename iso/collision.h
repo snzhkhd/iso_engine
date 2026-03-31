@@ -15,9 +15,6 @@
 
 namespace iso {
 
-    // Forward declare ChunkMap (defined in chunk.h)
-    class ChunkMap;
-
     // ─── Collision body (entity's physical shape) ─
 
     struct CollisionBody {
@@ -69,8 +66,8 @@ namespace iso {
     class CollisionSystem {
     public:
         /// Construct from IsoMap
-        explicit CollisionSystem(const IsoMap& map, const TileCollisionDefs* defs = nullptr)
-            : cfg_(map.config()), col_defs_(defs)
+        explicit CollisionSystem(const IsoMap& map, const CollisionResolver& resolver = {})
+            : cfg_(map.config()), resolver_(resolver)
         {
             tile_fn_ = [&map](LayerType layer, TileCoord tc) { return map.tile(layer, tc); };
             solid_fn_ = [&map](TileCoord tc) { return map.is_solid(tc); };
@@ -78,13 +75,19 @@ namespace iso {
 
         /// Construct from custom query functions
         CollisionSystem(IsoConfig cfg, TileQueryFn tile_fn, SolidQueryFn solid_fn,
-            const TileCollisionDefs* defs = nullptr)
+            const CollisionResolver& resolver = {})
             : cfg_(cfg), tile_fn_(std::move(tile_fn)), solid_fn_(std::move(solid_fn)),
-            col_defs_(defs)
+            resolver_(resolver)
         {}
 
         /// Set/change collision definitions at runtime
-        void set_collision_defs(const TileCollisionDefs* defs) { col_defs_ = defs; }
+        void set_collision_defs(const TileCollisionDefs* defs) {
+            resolver_.set_defs(defs);
+        }
+        void set_instance_overrides(const InstanceCollisionOverrides* ov) {
+            resolver_.set_overrides(ov);
+        }
+        void set_resolver(const CollisionResolver& r) { resolver_ = r; }
 
         // ─── Overlap checks ──────────────────────
 
@@ -115,8 +118,8 @@ namespace iso {
                         for (int layer = 1; layer < LAYER_COUNT; ++layer) {
                             TileData td = tile_fn_(static_cast<LayerType>(layer), { c, r, f });
                             if (td.is_solid()) {
-                                AABB3 tile_box = get_tile_aabb(c, r, f, td);
-                                if (body_aabb.overlaps(tile_box))
+                                auto shape = resolver_.resolve(td.tile_id, c, r, f);
+                                if (shape.overlaps(body_aabb, c, r, f, cfg_.floor_height))
                                     return true;
                             }
                         }
@@ -295,18 +298,7 @@ namespace iso {
         IsoConfig           cfg_;
         TileQueryFn         tile_fn_;
         SolidQueryFn        solid_fn_;
-        const TileCollisionDefs* col_defs_ = nullptr;
-
-        /// Get AABB for a tile — uses custom shape if defined, else full tile
-        [[nodiscard]] AABB3 get_tile_aabb(int c, int r, int f, const TileData& td) const {
-            if (col_defs_ && col_defs_->has(td.tile_id)) {
-                auto shape = col_defs_->get(td.tile_id);
-                if (shape.is_none()) return { {0,0,0},{0,0,0} }; // no collision
-                return shape.to_world_aabb(c, r, f, cfg_.floor_height);
-            }
-            // Default: full tile
-            return make_tile_aabb(c, r, f, td);
-        }
+        CollisionResolver   resolver_;
 
         [[nodiscard]] AABB3 make_tile_aabb(int c, int r, int f, const TileData& td) const {
             float zb = f * cfg_.floor_height;

@@ -24,7 +24,7 @@
 #include "raylib.h"
 #include "..//iso/iso_raylib.h"
 #include "tile_catalog.h"
-
+#include "..//iso/map.h"
 #include "editor_ui.h"
 #include "entity_layer.h"
 
@@ -36,6 +36,7 @@
 #include <unordered_set>
 #include "..//iso/renderer.h"
 
+#include "collision_editor.h"
 static iso::MapRenderer renderer;
 // ─── Constants ────────────────────────────────
 
@@ -90,8 +91,14 @@ struct UndoGroup {
 struct EditorState {
     // Map
     iso::ChunkMap map;
+    iso::TileCollisionDefs colDefs;
+    iso::InstanceCollisionOverrides colOverrides;
+
+    iso_ed::CollisionEditor colEditor;
 
     iso::IsoConfig config;
+
+    bool visibleLayer[5] = {true,true,true,true ,true };    //LayerType
 
     // Camera
     iso::IsoCamera camera;
@@ -153,6 +160,24 @@ struct EditorState {
     bool flag_climbable = false;
     bool flag_half_height= false;
     bool flag_door       = false;
+
+    // Selection
+    struct Selection {
+        enum class Type { None, Tile, Entity } type = Type::None;
+
+        // Tile selection
+        iso::TileCoord tile_coord{};
+        iso::LayerType tile_layer = iso::LayerType::Ground;
+        iso::TileData  tile_data{};
+
+        // Entity selection
+        uint32_t entity_id = 0;
+
+        void clear() { type = Type::None; entity_id = 0; }
+        bool has() const { return type != Type::None; }
+        bool is_tile() const { return type == Type::Tile; }
+        bool is_entity() const { return type == Type::Entity; }
+    } selection;
 };
 
 // ─── Undo system ──────────────────────────────
@@ -353,7 +378,8 @@ static void rect_fill(EditorState& ed, iso::TileCoord a, iso::TileCoord b) {
 
 // ─── Palette drawing ──────────────────────────
 
-static void draw_palette(EditorState& ed) {
+static void draw_palette(EditorState& ed) 
+{
     using namespace iso_ed::ui;
 
     Rectangle panel = {0, TOOLBAR_HEIGHT, PALETTE_WIDTH,
@@ -441,6 +467,9 @@ static void draw_palette(EditorState& ed) {
         {
             ed.selected_tile_id = tile->id;
             ed.tool = Tool::Brush;
+
+            if (ed.colEditor.active)
+                ed.colEditor.selected_tile_id = tile->id;
         }
 
         // Tooltip on hover
@@ -463,7 +492,8 @@ static void draw_palette(EditorState& ed) {
 
 // ─── Toolbar ──────────────────────────────────
 
-static void draw_toolbar(EditorState& ed) {
+static void draw_toolbar(EditorState& ed) 
+{
     using namespace iso_ed::ui;
 
     Rectangle bar = {0, 0, (float)SCREEN_W, TOOLBAR_HEIGHT};
@@ -518,64 +548,211 @@ static void draw_toolbar(EditorState& ed) {
 
     // Grid toggle
     x += 8;
-    Rectangle grid_r = {x, 4, 50, 28};
+    Rectangle grid_r = { x, 4, 50, 28 };
     toggle(grid_r, "Grid", &ed.show_grid);
+    x += 58;
+
+    // Layer visibility toggles
+    draw_label("Vis:", (int)x, 11, 12, theme.text_dim);
+    x += 30;
+    const char* vis_labels[] = { "G", "W", "O", "R", "E"};  // Ground, Wall, Object, Roof
+    const Color vis_colors[] = {
+        {80, 180, 80, 255},    // green
+        {180, 140, 100, 255},  // brown
+        {100, 160, 220, 255},  // blue
+        {180, 100, 100, 255},   // red
+        {180, 200, 100, 255}   // red
+    };
+    for (int i = 0; i < 5; ++i) {
+        Rectangle btn = { x, 4, 28, 28 };
+        Color bg = ed.visibleLayer[i]
+            ? Color{ vis_colors[i].r, vis_colors[i].g, vis_colors[i].b, 180 }
+        : Color{ 50, 50, 60, 255 };
+        DrawRectangleRec(btn, bg);
+        DrawRectangleLinesEx(btn, 1.f, ed.visibleLayer[i] ? vis_colors[i] : theme.border);
+        draw_label_centered(vis_labels[i], btn, 12,
+            ed.visibleLayer[i] ? theme.text_bright : theme.text_dim);
+        Vector2 mp = GetMousePosition();
+        if (CheckCollisionPointRec(mp, btn) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+            ed.visibleLayer[i] = !ed.visibleLayer[i];
+        x += 30;
+    }
 }
 
 // ─── Properties panel ─────────────────────────
 
 static void draw_props_panel(EditorState& ed) {
     using namespace iso_ed::ui;
+    if (!ed.show_props_panel) return;
 
-    float px = SCREEN_W - PROPS_WIDTH;
-    Rectangle panel = {px, TOOLBAR_HEIGHT, PROPS_WIDTH,
-                       (float)(SCREEN_H - TOOLBAR_HEIGHT - STATUSBAR_HEIGHT)};
+    float px = GetScreenWidth() - PROPS_WIDTH;
+    Rectangle panel = { px, TOOLBAR_HEIGHT, PROPS_WIDTH,
+                       (float)(GetScreenHeight() - TOOLBAR_HEIGHT - STATUSBAR_HEIGHT) };
     draw_panel(panel);
 
     float y = panel.y + 8;
     float x = panel.x + 8;
     float w = PROPS_WIDTH - 16;
 
-    draw_label("Tile Flags", (int)x, (int)y, 14, theme.text_bright);
-    y += 22;
+    if (!ed.selection.has()) {
+        // ── No selection — show paint flags ───
+        draw_label("Paint flags", (int)x, (int)y, 14, theme.text_bright); y += 22;
+        toggle({ x, y, w, 22 }, "Solid", &ed.flag_solid); y += 26;
+        toggle({ x, y, w, 22 }, "Blocks LOS", &ed.flag_blocks_los); y += 26;
+        toggle({ x, y, w, 22 }, "Platform", &ed.flag_platform); y += 26;
+        toggle({ x, y, w, 22 }, "Climbable", &ed.flag_climbable); y += 26;
+        toggle({ x, y, w, 22 }, "Half-height", &ed.flag_half_height); y += 26;
+        toggle({ x, y, w, 22 }, "Door", &ed.flag_door); y += 34;
 
-    toggle({x, y, w, 22}, "Solid (blocks movement)", &ed.flag_solid); y += 26;
-    toggle({x, y, w, 22}, "Blocks LOS", &ed.flag_blocks_los); y += 26;
-    toggle({x, y, w, 22}, "Platform (walkable)", &ed.flag_platform); y += 26;
-    toggle({x, y, w, 22}, "Climbable (stairs)", &ed.flag_climbable); y += 26;
-    toggle({x, y, w, 22}, "Half-height (fence)", &ed.flag_half_height); y += 26;
-    toggle({x, y, w, 22}, "Door", &ed.flag_door); y += 34;
-
-    // Selected tile info
-    draw_label("Selected Tile", (int)x, (int)y, 14, theme.text_bright);
-    y += 22;
-    if (ed.selected_tile_id > 0) {
-        const auto* tile = ed.catalog.get(ed.selected_tile_id);
-        if (tile) {
-            draw_label(TextFormat("Name: %s", tile->name.c_str()), (int)x, (int)y, 12, theme.text);
-            y += 16;
-            draw_label(TextFormat("Size: %dx%d", tile->src_width, tile->src_height), (int)x, (int)y, 12, theme.text);
-            y += 16;
-            draw_label(TextFormat("Cat: %s", iso_ed::TileCatalog::category_name(tile->category)),
-                       (int)x, (int)y, 12, theme.text);
-            y += 22;
-
-            // Preview
-            float prev_h = 120;
-            float scale = std::min(
-                (w - 8) / (float)tile->texture.width,
-                prev_h / (float)tile->texture.height
-            );
-            float tw = tile->texture.width * scale;
-            float th = tile->texture.height * scale;
-            float tx = x + (w - tw) * 0.5f;
-            DrawRectangle((int)x, (int)y, (int)w, (int)prev_h + 8, theme.bg_item);
-            DrawTextureEx(tile->texture, {tx, y + 4}, 0.f, scale, WHITE);
+        // Selected tile preview
+        draw_label("Selected tile", (int)x, (int)y, 14, theme.text_bright); y += 22;
+        if (ed.selected_tile_id > 0) {
+            const auto* te = ed.catalog.get(ed.selected_tile_id);
+            if (te) {
+                draw_label(TextFormat("ID: %d  %s", te->id, te->name.c_str()),
+                    (int)x, (int)y, 12, theme.text); y += 16;
+                draw_label(TextFormat("Size: %dx%d", te->src_width, te->src_height),
+                    (int)x, (int)y, 12, theme.text); y += 22;
+                float scale = std::min((w - 8) / (float)te->texture.width, 100.f / (float)te->texture.height);
+                DrawTextureEx(te->texture, { x, y }, 0.f, scale, WHITE);
+            }
         }
-    } else {
-        draw_label("(none)", (int)x, (int)y, 12, theme.text_dim);
+        return;
+    }
+
+    if (ed.selection.is_tile()) {
+        // ── Tile properties ───────────────────
+        auto& sel = ed.selection;
+        auto td = ed.map.tile(sel.tile_layer, sel.tile_coord);
+
+        draw_label("TILE PROPERTIES", (int)x, (int)y, 14, theme.text_bright); y += 20;
+        draw_label(TextFormat("Pos: %d, %d  Floor: %d",
+            sel.tile_coord.col, sel.tile_coord.row, sel.tile_coord.floor),
+            (int)x, (int)y, 12, theme.text); y += 16;
+        draw_label(TextFormat("Layer: %s  ID: %d",
+            layer_names[(int)sel.tile_layer], td.tile_id),
+            (int)x, (int)y, 12, theme.text); y += 16;
+        draw_label(TextFormat("Height: %d  Variant: %d",
+            td.height, td.variant),
+            (int)x, (int)y, 12, theme.text); y += 22;
+
+        // Editable flags
+        draw_label("Flags:", (int)x, (int)y, 13, theme.text_bright); y += 18;
+
+        bool solid = td.is_solid();
+        bool los = td.blocks_los();
+        bool platform = td.is_platform();
+        bool climb = iso::has_flag(td.flags, iso::TileFlags::Climbable);
+        bool half = iso::has_flag(td.flags, iso::TileFlags::HalfHeight);
+        bool door = iso::has_flag(td.flags, iso::TileFlags::Door);
+
+        bool changed = false;
+        if (toggle({ x, y, w, 20 }, "Solid", &solid)) changed = true; y += 24;
+        if (toggle({ x, y, w, 20 }, "Blocks LOS", &los)) changed = true; y += 24;
+        if (toggle({ x, y, w, 20 }, "Platform", &platform)) changed = true; y += 24;
+        if (toggle({ x, y, w, 20 }, "Climbable", &climb)) changed = true; y += 24;
+        if (toggle({ x, y, w, 20 }, "Half-height", &half)) changed = true; y += 24;
+        if (toggle({ x, y, w, 20 }, "Door", &door)) changed = true; y += 28;
+
+        if (changed) {
+            iso::TileFlags flags = iso::TileFlags::None;
+            if (solid)    flags = flags | iso::TileFlags::Solid;
+            if (los)      flags = flags | iso::TileFlags::BlocksLOS;
+            if (platform) flags = flags | iso::TileFlags::Platform;
+            if (climb)    flags = flags | iso::TileFlags::Climbable;
+            if (half)     flags = flags | iso::TileFlags::HalfHeight;
+            if (door)     flags = flags | iso::TileFlags::Door;
+            td.flags = flags;
+            ed.map.set_tile(sel.tile_layer, sel.tile_coord, td);
+            ed.modified = true;
+        }
+
+        // Tile preview
+        const auto* te = ed.catalog.get(td.tile_id);
+        if (te && te->loaded) {
+            float scale = std::min((w - 8) / (float)te->texture.width, 80.f / (float)te->texture.height);
+            DrawRectangle((int)x, (int)y, (int)w, (int)(te->texture.height * scale) + 8, theme.bg_item);
+            DrawTextureEx(te->texture, { x + 4, y + 4 }, 0.f, scale, WHITE);
+            y += te->texture.height * scale + 16;
+        }
+
+        // Delete tile button
+        Rectangle del_btn = { x, y, w, 24 };
+        if (button(del_btn, "Delete tile")) {
+            ed.map.set_tile(sel.tile_layer, sel.tile_coord, iso::TileData{});
+            ed.selection.clear();
+            ed.modified = true;
+        }
+
+    }
+    else if (ed.selection.is_entity()) {
+        // ── Entity properties ─────────────────
+        iso::MapEntity* ent = ed.map.entities().find(ed.selection.entity_id);
+        if (!ent) { ed.selection.clear(); return; }
+
+        draw_label("ENTITY PROPERTIES", (int)x, (int)y, 14, theme.text_bright); y += 20;
+        draw_label(TextFormat("ID: %d  Tile: %d", ent->id, ent->tile_id),
+            (int)x, (int)y, 12, theme.text); y += 16;
+        draw_label(TextFormat("Pos: %.2f, %.2f  Floor: %d", ent->x, ent->y, ent->floor),
+            (int)x, (int)y, 12, theme.text); y += 16;
+        draw_label(TextFormat("z_bias: %d  rot: %.0f", ent->z_bias, ent->rotation),
+            (int)x, (int)y, 12, theme.text); y += 22;
+
+        // Type
+        draw_label("Type:", (int)x, (int)y, 13, theme.text_bright); y += 18;
+        const char* types[] = { "Static", "Dynamic", "Networked" };
+        for (int i = 0; i < 3; ++i) {
+            Rectangle btn = { x + i * 68.f, y, 64, 20 };
+            if (button(btn, types[i], (int)ent->type == i, 10)) {
+                ent->type = static_cast<iso::EntityType>(i);
+                ed.modified = true;
+            }
+        }
+        y += 26;
+
+        // Flags
+        draw_label("Flags:", (int)x, (int)y, 13, theme.text_bright); y += 18;
+        bool solid = ent->is_solid();
+        bool interact = ent->is_interactable();
+        if (toggle({ x, y, w, 20 }, "Solid", &solid)) {
+            ent->set_solid(solid); ed.modified = true;
+        } y += 24;
+        if (toggle({ x, y, w, 20 }, "Interactable", &interact)) {
+            if (interact) ent->flags = ent->flags | iso::EntityFlags::Interactable;
+            else ent->flags = static_cast<iso::EntityFlags>(
+                (uint8_t)ent->flags & ~(uint8_t)iso::EntityFlags::Interactable);
+            ed.modified = true;
+        } y += 24;
+
+        // z_bias
+        draw_label("z_bias:", (int)x, (int)y, 13, theme.text_bright); y += 18;
+        Rectangle zbias_r = { x, y, w, 24 };
+        int zb = ent->z_bias;
+        if (spinner(zbias_r, "Z", &zb, -10, 10)) {
+            ent->z_bias = zb;
+            ed.modified = true;
+        }
+        y += 30;
+
+        // Preview
+        const auto* te = ed.catalog.get(ent->tile_id);
+        if (te && te->loaded) {
+            float scale = std::min((w - 8) / (float)te->texture.width, 80.f / (float)te->texture.height);
+            DrawRectangle((int)x, (int)y, (int)w, (int)(te->texture.height * scale) + 8, theme.bg_item);
+            DrawTextureEx(te->texture, { x + 4, y + 4 }, 0.f, scale, WHITE);
+            y += te->texture.height * scale + 16;
+        }
+
+        // Delete
+        Rectangle del_btn = { x, y, w, 24 };
+        if (button(del_btn, "Delete entity")) {
+            ed.map.entities().remove(ent->id);
+            ed.selection.clear();
+            ed.modified = true;
+        }
     }
 }
+
 
 // ─── Status bar ───────────────────────────────
 
@@ -621,6 +798,9 @@ static void draw_statusbar(EditorState& ed, iso::TileCoord hover_tile) {
     DrawText(TextFormat("Map: %d×%d  Chunks: %d",
         bmax.col - bmin.col + 1, bmax.row - bmin.row + 1, ed.map.chunk_count()),
         (int)(x + 100), SCREEN_H - 20, 12, theme.text_dim);
+
+    if (ed.colEditor.active)
+        draw_label("COLLISION[C]", (int)(x + 240), SCREEN_H - 20, 12, iso_ed::ui::theme.danger);
 }
 
 static void draw_minimap(EditorState& ed) {
@@ -747,7 +927,13 @@ static void draw_map_viewport(EditorState& ed, iso::TileCoord hover_tile)
     // Draw — just provide your draw functions
     float zoom = ed.camera.zoom();
     renderer.render({
-        .on_ground = [&](const iso::DrawItem& item) {
+
+        
+        .on_ground = [&](const iso::DrawItem& item) 
+        {
+            if (!ed.visibleLayer[0])
+                return;
+
             const auto* te = ed.catalog.get(item.tile.tile_id);
             if (te && te->loaded && !lod.use_simple_draw(va.tile_screen_size)) {
                 float tw = te->src_width * zoom + cfg.tile_padding;
@@ -773,7 +959,11 @@ static void draw_map_viewport(EditorState& ed, iso::TileCoord hover_tile)
           DrawTriangle(pts[0], pts[2], pts[1], {80,130,60,a});
         }
         },
-        .on_wall = [&](const iso::DrawItem& item) {
+        .on_wall = [&](const iso::DrawItem& item) 
+        {
+            if (!ed.visibleLayer[1])
+                return;
+
             const auto* te = ed.catalog.get(item.tile.tile_id);
             if (!te || !te->loaded) return;
             float tw = te->src_width * zoom;
@@ -785,7 +975,10 @@ static void draw_map_viewport(EditorState& ed, iso::TileCoord hover_tile)
                             item.screen_pos.y + screen_hh - th, tw, th};
             DrawTexturePro(te->texture, src, dst, {0,0}, 0.f, {255,255,255,a});
         },
-        .on_object = [&](const iso::DrawItem& item) {
+        .on_object = [&](const iso::DrawItem& item) 
+        {
+            if (!ed.visibleLayer[2])
+                return;
             // Same as on_wall (bottom-center anchor)
             const auto* te = ed.catalog.get(item.tile.tile_id);
             if (!te || !te->loaded) return;
@@ -798,7 +991,10 @@ static void draw_map_viewport(EditorState& ed, iso::TileCoord hover_tile)
                             item.screen_pos.y + screen_hh - th, tw, th};
             DrawTexturePro(te->texture, src, dst, {0,0}, 0.f, {255,255,255,a});
         },
-        .on_overlay = [&](const iso::DrawItem& item) {
+        .on_overlay = [&](const iso::DrawItem& item) 
+        {
+            if (!ed.visibleLayer[3])
+                return;
             // Same anchor as wall
             const auto* te = ed.catalog.get(item.tile.tile_id);
             if (!te || !te->loaded) return;
@@ -811,7 +1007,10 @@ static void draw_map_viewport(EditorState& ed, iso::TileCoord hover_tile)
                             item.screen_pos.y + screen_hh - th, tw, th};
             DrawTexturePro(te->texture, src, dst, {0,0}, 0.f, {255,255,255,a});
         },
-        .on_entity = [&](const iso::DrawItem& item) {
+        .on_entity = [&](const iso::DrawItem& item) 
+        {
+            if (!ed.visibleLayer[4])
+                return;
             const auto* te = ed.catalog.get(item.entity->tile_id);
             if (!te || !te->loaded) return;
             float tw = te->src_width * zoom;
@@ -922,7 +1121,23 @@ static void draw_map_viewport(EditorState& ed, iso::TileCoord hover_tile)
         }
     }
 
+    ed.colEditor.draw_on_map(ed.map, ed.colDefs, ed.camera, ed.config, ed.current_floor);
+
     EndScissorMode();
+
+
+    // Selection highlight
+    if (ed.selection.is_tile()) {
+        iso::draw_tile_highlight(ed.camera, cfg, ed.selection.tile_coord, { 0, 200, 255, 80 });
+    }
+    if (ed.selection.is_entity()) {
+        iso::MapEntity* ent = ed.map.entities().find(ed.selection.entity_id);
+        if (ent) {
+            iso::Vec2 sp = ed.camera.world_to_screen({ ent->x, ent->y,
+                ed.current_floor * cfg.floor_height });
+            DrawCircle((int)sp.x, (int)sp.y, 8.f * ed.camera.zoom(), { 0, 200, 255, 120 });
+        }
+    }
 }
 
 // ─── Input handling ───────────────────────────
@@ -941,6 +1156,12 @@ static void handle_input(EditorState& ed, iso::TileCoord hover_tile)
 {
     bool viewport_hover = is_viewport_hovered(ed);
     bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+    bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+
+
+    bool lmb_pressed = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+    bool lmb_down = IsMouseButtonDown(MOUSE_BUTTON_LEFT);
+    bool rmb_down = IsMouseButtonDown(MOUSE_BUTTON_RIGHT);
 
     // ── Keyboard shortcuts ────────────────────
     if (IsKeyPressed(KEY_O)) ed.entity_mode = !ed.entity_mode;
@@ -962,6 +1183,7 @@ static void handle_input(EditorState& ed, iso::TileCoord hover_tile)
     if (IsKeyPressed(KEY_G))   ed.show_ghost = !ed.show_ghost;
     if (IsKeyPressed(KEY_P))   ed.show_props_panel = !ed.show_props_panel;
 
+    if (IsKeyPressed(KEY_C)) ed.colEditor.toggle();
 
     if (!ctrl && IsKeyPressed(KEY_PAGE_UP))   ed.current_floor = std::min(ed.current_floor + 1, ed.config.max_floor);
     if (!ctrl && IsKeyPressed(KEY_PAGE_DOWN)) ed.current_floor = std::max(ed.current_floor - 1, ed.config.min_floor);
@@ -981,6 +1203,47 @@ static void handle_input(EditorState& ed, iso::TileCoord hover_tile)
         printf("height_pixel_offset=%f\n", ed.config.height_pixel_offset);
     }
 
+    // ── Shift+Click = select for properties ───
+    if (!ed.colEditor.active && !ed.entity_mode && lmb_pressed && shift)
+    {
+        // Try entity first
+        iso::Vec3 world = ed.camera.screen_to_world(
+            iso::from_rl(GetMousePosition()),
+            ed.current_floor * ed.config.floor_height);
+        float sx = world.x, sy = world.y;
+
+        auto* hit = ed.map.entities().pick(sx, sy, ed.current_floor, 0.6f);
+        if (hit) {
+            ed.selection.type = EditorState::Selection::Type::Entity;
+            ed.selection.entity_id = hit->id;
+            ed.show_props_panel = true;
+            ed.status.set(TextFormat("Selected entity #%d", hit->id),
+                iso_ed::ui::theme.accent);
+        }
+        else {
+            // Try tile on current layer
+            auto layer = static_cast<iso::LayerType>(ed.current_layer);
+            auto td = ed.map.tile(layer, { hover_tile.col, hover_tile.row, ed.current_floor });
+            if (!td.is_empty()) {
+                ed.selection.type = EditorState::Selection::Type::Tile;
+                ed.selection.tile_coord = { hover_tile.col, hover_tile.row, ed.current_floor };
+                ed.selection.tile_layer = layer;
+                ed.selection.tile_data = td;
+                ed.show_props_panel = true;
+                ed.status.set(TextFormat("Selected tile %d at %d,%d",
+                    td.tile_id, hover_tile.col, hover_tile.row),
+                    iso_ed::ui::theme.accent);
+            }
+        }
+        return; // don't process other tools
+    }
+
+    // ESC clears selection
+    if (IsKeyPressed(KEY_ESCAPE) && ed.selection.has()) {
+        ed.selection.clear();
+    }
+
+
     // Save
     if (ctrl && IsKeyPressed(KEY_S)) 
     {
@@ -990,6 +1253,10 @@ static void handle_input(EditorState& ed, iso::TileCoord hover_tile)
         if (iso::save_isomap(ed.map, ed.current_filepath)) {
             ed.status.set(TextFormat("Saved! (%d chunks)", ed.map.chunk_count()),
                 iso_ed::ui::theme.success);
+
+            std::string col_path = ed.current_filepath.substr(0, ed.current_filepath.rfind('.')) + ".isocol";
+            ed.colDefs.save(col_path);
+
             ed.modified = false;
         }
         else {
@@ -1010,9 +1277,8 @@ static void handle_input(EditorState& ed, iso::TileCoord hover_tile)
     // ── Mouse tools (only in viewport) ────────
     if (!viewport_hover) return;
 
-    bool lmb_pressed = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
-    bool lmb_down    = IsMouseButtonDown(MOUSE_BUTTON_LEFT);
-    bool rmb_down    = IsMouseButtonDown(MOUSE_BUTTON_RIGHT);
+    if (ed.colEditor.active)  return;
+
 
     // ── Entity mode (free placement) ──────────
     if (ed.entity_mode && viewport_hover) 
@@ -1178,16 +1444,20 @@ static void handle_input(EditorState& ed, iso::TileCoord hover_tile)
 
 // ─── File drop handling ───────────────────────
 
-static void handle_file_drop(EditorState& ed) {
+static void handle_file_drop(EditorState& ed) 
+{
     if (!IsFileDropped()) return;
 
     FilePathList files = LoadDroppedFiles();
-    for (int i = 0; i < (int)files.count; ++i) {
+    for (int i = 0; i < (int)files.count; ++i) 
+    {
         std::string path = files.paths[i];
         std::string ext = GetFileExtension(path.c_str());
 
-        if (ext == ".isomap") {
-            if (iso::load_isomap(ed.map, path)) {
+        if (ext == ".isomap") 
+        {
+            if (iso::load_isomap(ed.map, path)) 
+            {
                 ed.config = ed.map.config();
                 ed.camera.set_config(ed.config);
                 ed.current_filepath = path;
@@ -1195,14 +1465,24 @@ static void handle_file_drop(EditorState& ed) {
                 ed.current_floor = 0;
                 ed.undo_stack.clear();
                 ed.redo_stack.clear();
-                ed.status.set(TextFormat("Loaded! (%d chunks)", ed.map.chunk_count()),
-                    iso_ed::ui::theme.success);
+                ed.status.set(TextFormat("Loaded! (%d chunks)", ed.map.chunk_count()), iso_ed::ui::theme.success);
+
+                std::string col_path = path.substr(0, path.rfind('.')) + ".isocol";
+                bool col = ed.colDefs.load(col_path);  // ok if file doesn't exist
+                ed.colOverrides.load("assets/maps/map.iscov");
+                if (col)
+                {
+                    ed.status.set("collisions Loaded! ", iso_ed::ui::theme.success);
+
+                }
             }
         }
-        else if (ext == ".png" || ext == ".jpg" || ext == ".bmp") {
+        else if (ext == ".png" || ext == ".jpg" || ext == ".bmp") 
+        {
             // Add tile to catalog
             int id = ed.catalog.add_tile(path);
-            if (id >= 0) {
+            if (id >= 0) 
+            {
                 ed.status.set(TextFormat("Added tile: %s", GetFileName(path.c_str())), iso_ed::ui::theme.success);
             }
         }
@@ -1238,6 +1518,8 @@ int main(int argc, char* argv[])
     ed.camera = iso::IsoCamera(ed.config, SCREEN_W, SCREEN_H);
     ed.camera.set_position({16.f, 16.f, 0.f});
     ed.camera.set_zoom(0.25f);
+
+  //  ed.colResolver = iso::CollisionResolver(&ed.colDefs, &ed.colOverrides);
 
     // Load tiles from command line arg or default path
     std::string tiles_dir = (argc > 1) ? argv[1] : "assets/tiles";
@@ -1281,8 +1563,15 @@ int main(int argc, char* argv[])
         if (ed.show_props_panel)
             draw_props_panel(ed);
         draw_statusbar(ed, hover_tile);
-
         draw_minimap(ed);
+
+        if (ed.colEditor.active) {
+            float col_panel_w = 320;
+            float col_panel_x = GetScreenWidth() - col_panel_w - 4;
+            float col_panel_y = TOOLBAR_HEIGHT + 4;
+            float col_panel_h = GetScreenHeight() - TOOLBAR_HEIGHT - STATUSBAR_HEIGHT - 8;
+            ed.colEditor.draw(ed.colDefs, ed.catalog, ed.config, col_panel_x, col_panel_y, col_panel_w, col_panel_h);
+        }
         // FPS (debug)
         DrawFPS(SCREEN_W - 80, 4);
 

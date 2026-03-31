@@ -361,13 +361,13 @@ namespace iso {
 
     /// Create CollisionSystem from a ChunkMap
     inline CollisionSystem make_collision(const ChunkMap& map,
-        const TileCollisionDefs* defs = nullptr)
+        const CollisionResolver& resolver = {})
     {
         return CollisionSystem(
             map.config(),
             [&map](LayerType layer, TileCoord tc) { return map.tile(layer, tc); },
             [&map](TileCoord tc) { return map.is_solid(tc); },
-            defs
+            resolver
         );
     }
 

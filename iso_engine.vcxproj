@@ -147,6 +147,7 @@
     <ClCompile Include="editor\editor_main.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="editor\collision_editor.h" />
     <ClInclude Include="editor\editor_ui.h" />
     <ClInclude Include="editor\entity_layer.h" />
     <ClInclude Include="editor\tile_catalog.h" />

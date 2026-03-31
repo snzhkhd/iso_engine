@@ -74,5 +74,8 @@
     <ClInclude Include="iso\tile_collision.h">
       <Filter>Файлы заголовков\iso_engine</Filter>
     </ClInclude>
+    <ClInclude Include="editor\collision_editor.h">
+      <Filter>Файлы заголовков\editor</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>
