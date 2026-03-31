@@ -34,6 +34,9 @@
 #include <algorithm>
 #include <deque>
 #include <unordered_set>
+#include "..//iso/renderer.h"
+
+static iso::MapRenderer renderer;
 // ─── Constants ────────────────────────────────
 
 static constexpr int MAX_FILL = 4096;
@@ -723,219 +726,117 @@ static void draw_map_viewport(EditorState& ed, iso::TileCoord hover_tile)
     BeginScissorMode((int)vp_x, (int)vp_y, (int)vp_w, (int)vp_h);
     const auto& cfg = ed.config;
 
-    int draw_min_floor = cfg.min_floor;
-    int draw_max_floor = ed.show_all_opaque ? cfg.max_floor : ed.current_floor;
+    // Compute visible area
+    auto va = iso::VisibleArea::from_camera(ed.camera, cfg, vp_x, vp_y, vp_w, vp_h);
 
-    // Find visible tile range from camera
-    iso::Vec3 tl = ed.camera.screen_to_world({ vp_x, vp_y });
-    iso::Vec3 br = ed.camera.screen_to_world({ vp_x + vp_w, vp_y + vp_h });
-    iso::Vec3 tr = ed.camera.screen_to_world({ vp_x + vp_w, vp_y });
-    iso::Vec3 bl = ed.camera.screen_to_world({ vp_x, vp_y + vp_h });
-    // Generous padding
-    int vis_col_min = (int)std::floor(std::min({ tl.x, br.x, tr.x, bl.x })) - 4;
-    int vis_col_max = (int)std::ceil(std::max({ tl.x, br.x, tr.x, bl.x })) + 4;
-    int vis_row_min = (int)std::floor(std::min({ tl.y, br.y, tr.y, bl.y })) - 4;
-    int vis_row_max = (int)std::ceil(std::max({ tl.y, br.y, tr.y, bl.y })) + 4;
+    // Floor visibility
+    iso::FloorVis fv;
+    fv.current_floor = ed.current_floor;
+    fv.show_all_opaque = ed.show_all_opaque;
+    fv.min_floor = cfg.min_floor;
+    fv.max_floor = cfg.max_floor;
 
-    auto [cmin, cmax] = iso::ChunkMap::chunk_range(
-        vis_col_min, vis_row_min, vis_col_max, vis_row_max);
+    // LOD
+    iso::RenderLOD lod;
+    lod.update(ed.camera.zoom(), cfg.tile_width);
 
-    //zoom
+    // Collect & sort
+    renderer.collect(ed.map, ed.camera, va, fv, lod);
+    renderer.sort();
+
+    // Draw — just provide your draw functions
     float zoom = ed.camera.zoom();
-    float min_tile_screen = cfg.tile_width * zoom;
-    bool skip_objects = min_tile_screen < 8.f;   // объекты < 8px — не рисовать
-    bool skip_walls = min_tile_screen < 4.f;    // стены < 4px — не рисовать
-    bool draw_simple = min_tile_screen < 16.f;   // < 16px — рисовать цветные ромбы вместо текстур
-
-    for (int f = draw_min_floor; f <= draw_max_floor; ++f) 
-    {
-        float floor_alpha = (ed.show_all_opaque) ? 1.0f
-            : (f < ed.current_floor) ? 0.3f : 1.0f;
-        unsigned char alpha = (unsigned char)(255 * floor_alpha);
-
-        // 1) Ground layer — always first
-        ed.map.for_each_chunk_in(cmin, cmax, [&](iso::ChunkCoord cc, const iso::Chunk& chunk) 
-            {
-            int ox = cc.origin_col();
-            int oy = cc.origin_row();
-            for (int lr = 0; lr < iso::CHUNK_SIZE; ++lr) 
-            {
-                for (int lc = 0; lc < iso::CHUNK_SIZE; ++lc) 
-                {
-                    const iso::TileData& td = chunk.tile_safe(
-                        iso::LayerType::Ground, lc, lr, f);
-                    if (td.is_empty()) continue;
-
-                    int col = ox + lc, row = oy + lr;
-                    iso::Vec3 world = iso::tile_to_world({ col, row, f }, cfg);
-                    iso::Vec2 sp = ed.camera.world_to_screen(world);
-                    if (sp.x < vp_x - 300 || sp.x > vp_x + vp_w + 300 ||
-                        sp.y < vp_y - 300 || sp.y > vp_y + vp_h + 300) continue;
-
-                    if (draw_simple) {
-                        // Дешёвый цветной ромб вместо текстуры
-                        float hw = cfg.tile_width * 0.5f * zoom;
-                        float hh = cfg.tile_height * 0.5f * zoom;
-                        Color c = { 80, 130, 60, alpha };  // simplified color
-                        Vector2 pts[4] = { {sp.x,sp.y - hh},{sp.x + hw,sp.y},{sp.x,sp.y + hh},{sp.x - hw,sp.y} };
-                        DrawTriangle(pts[0], pts[3], pts[2], c);
-                        DrawTriangle(pts[0], pts[2], pts[1], c);
-                        continue;  // skip texture draw
-                    }
-
-
-                    const auto* te = ed.catalog.get(td.tile_id);
-                    if (te && te->loaded) {
-                        float zoom = ed.camera.zoom();
-                        float tw = te->src_width * zoom;
-                        float th = te->src_height * zoom;
-                        Rectangle src = { 0, 0, (float)te->src_width, (float)te->src_height };
-                        Rectangle dst = { sp.x - tw * 0.5f, sp.y - th * 0.5f, tw, th };
-                        DrawTexturePro(te->texture, src, dst, { 0,0 }, 0.f, { 255,255,255,alpha });
-                    }
-                    else {
-                        float hw = ed.camera.tile_draw_hw();
-                        float hh = ed.camera.tile_draw_hh();
-                        Color c = { 80, 140, 60, (unsigned char)(180 * floor_alpha) };
-                        Vector2 pts[4] = { {sp.x,sp.y - hh},{sp.x + hw,sp.y},{sp.x,sp.y + hh},{sp.x - hw,sp.y} };
-                        DrawTriangle(pts[0], pts[3], pts[2], c);
-                        DrawTriangle(pts[0], pts[2], pts[1], c);
-                    }
-                }
-            }
-            });
-
-        // 2) Collect walls/objects/overlays + entities into one list
-        struct DrawItem {
-            float depth;
-            bool is_entity;
-            int col, row, layer;
-            const iso::MapEntity* ent;  
-        };
-        std::vector<DrawItem> items;
-
-        // Add tile layers 1-3 from visible chunks
-        ed.map.for_each_chunk_in(cmin, cmax, [&](iso::ChunkCoord cc, const iso::Chunk& chunk) 
-            {
-            int ox = cc.origin_col();
-            int oy = cc.origin_row();
-
-            iso::Vec2 chunk_center = ed.camera.world_to_screen(
-                iso::tile_to_world({ ox + iso::CHUNK_SIZE / 2, oy + iso::CHUNK_SIZE / 2, f }, cfg));
-            float chunk_radius = iso::CHUNK_SIZE * cfg.tile_width * zoom;
-            if (chunk_center.x < vp_x - chunk_radius || chunk_center.x > vp_x + vp_w + chunk_radius ||
-                chunk_center.y < vp_y - chunk_radius || chunk_center.y > vp_y + vp_h + chunk_radius)
-                return;  // entire chunk off-screen
-
-            for (int lr = 0; lr < iso::CHUNK_SIZE; ++lr) 
-            {
-                for (int lc = 0; lc < iso::CHUNK_SIZE; ++lc) 
-                {
-                    int col = ox + lc, row = oy + lr;
-                    for (int layer = 1; layer < iso::LAYER_COUNT; ++layer) 
-                    {
-                        if (skip_objects && layer >= 2) continue;  // skip objects/overlay
-                        if (skip_walls && layer == 1) continue;   // skip walls
-
-                        const iso::TileData& td = chunk.tile_safe(
-                            static_cast<iso::LayerType>(layer), lc, lr, f);
-                        if (td.is_empty()) continue;
-                        items.push_back({
-                            (float)(col + row) + layer * 0.1f,
-                            false, col, row, layer, nullptr
-                            });
-                    }
-                }
-            }
-            });
-
-        
-        if (!skip_objects)
-        {
-            // Add entities on this floor
-            for (const auto& ent : ed.map.entities().all()) {
-                if (ent.floor != f) continue;
-                items.push_back({
-                    ent.iso_depth(),
-                    true, 0, 0, 0, &ent
-                    });
-            }
-        }
-        
-
-        // Sort by depth
-        std::sort(items.begin(), items.end(),
-            [](const DrawItem& a, const DrawItem& b) { return a.depth < b.depth; });
-
-        // 3) Draw sorted
-        for (const auto& item : items) {
-            if (!item.is_entity) {
-                iso::Vec3 world = iso::tile_to_world({ item.col, item.row, f }, cfg);
-                iso::Vec2 sp = ed.camera.world_to_screen(world);
-                if (sp.x < vp_x - 300 || sp.x > vp_x + vp_w + 300 ||
-                    sp.y < vp_y - 300 || sp.y > vp_y + vp_h + 300) continue;
-
-                iso::TileData td = ed.map.tile(
-                    static_cast<iso::LayerType>(item.layer),
-                    { item.col, item.row, f });
-                const auto* te = ed.catalog.get(td.tile_id);
-                if (te && te->loaded) {
-                    float zoom = ed.camera.zoom();
-                    float tw = te->src_width * zoom;
-                    float th = te->src_height * zoom;
-                    float dx = sp.x - tw * 0.5f;
-                    float screen_hh = cfg.tile_height * 0.5f * zoom;
-                    float dy = sp.y + screen_hh - th;
-                    Rectangle src = { 0, 0, (float)te->src_width, (float)te->src_height };
-                    Rectangle dst = { dx, dy, tw, th };
-                    DrawTexturePro(te->texture, src, dst, { 0,0 }, 0.f, { 255,255,255,alpha });
-                }
-                else {
-                    float hw = ed.camera.tile_draw_hw();
-                    float hh = ed.camera.tile_draw_hh();
-                    Color c = (item.layer == 1) ? Color{ 160,140,120,(unsigned char)(200 * floor_alpha) }
-                        : (item.layer == 2) ? Color{ 120,100,80,(unsigned char)(180 * floor_alpha) }
-                    : Color{ 140,80,80,(unsigned char)(120 * floor_alpha) };
-                    Vector2 pts[4] = { {sp.x,sp.y - hh},{sp.x + hw,sp.y},{sp.x,sp.y + hh},{sp.x - hw,sp.y} };
-                    DrawTriangle(pts[0], pts[3], pts[2], c);
-                    DrawTriangle(pts[0], pts[2], pts[1], c);
-                }
-            }
-            else {
-                const auto* ent = item.ent;
-                const auto* te = ed.catalog.get(ent->tile_id);
-                if (!te || !te->loaded) continue;
-
-                iso::Vec3 wpos = { ent->x, ent->y, f * cfg.floor_height };
-                iso::Vec2 sp = ed.camera.world_to_screen(wpos);
-                if (sp.x < vp_x - 300 || sp.x > vp_x + vp_w + 300 ||
-                    sp.y < vp_y - 300 || sp.y > vp_y + vp_h + 300) continue;
-
-                float zoom = ed.camera.zoom();
-                float tw = te->src_width * zoom;
-                float th = te->src_height * zoom;
-                float dx = sp.x - tw * 0.5f;
-                float screen_hh = cfg.tile_height * 0.5f * zoom;
-                float dy = sp.y + screen_hh - th;
+    renderer.render({
+        .on_ground = [&](const iso::DrawItem& item) {
+            const auto* te = ed.catalog.get(item.tile.tile_id);
+            if (te && te->loaded && !lod.use_simple_draw(va.tile_screen_size)) {
+                float tw = te->src_width * zoom + cfg.tile_padding;
+                float th = te->src_height * zoom + cfg.tile_padding;
+                unsigned char a = (unsigned char)(255 * item.alpha);
+                // floor вместо просто вычитания — гарантирует что тайлы всегда перекрываются
+                float dx = std::floor(item.screen_pos.x - tw * 0.5f);
+                float dy = std::floor(item.screen_pos.y - th * 0.5f);
                 Rectangle src = { 0, 0, (float)te->src_width, (float)te->src_height };
-                Rectangle dst = { dx, dy, tw, th };
-                DrawTexturePro(te->texture, src, dst, { 0,0 }, 0.f, { 255,255,255,alpha });
+                Rectangle dst = { dx, dy, std::ceil(tw), std::ceil(th) };
+                DrawTexturePro(te->texture, src, dst, { 0,0 }, 0.f, { 255,255,255,a });
+            }
+         else {
+          float hw = cfg.tile_width * 0.5f * zoom;
+          float hh = cfg.tile_height * 0.5f * zoom;
+          unsigned char a = (unsigned char)(180 * item.alpha);
+          Vector2 pts[4] = {
+              {item.screen_pos.x, item.screen_pos.y - hh},
+              {item.screen_pos.x + hw, item.screen_pos.y},
+              {item.screen_pos.x, item.screen_pos.y + hh},
+              {item.screen_pos.x - hw, item.screen_pos.y}};
+          DrawTriangle(pts[0], pts[3], pts[2], {80,130,60,a});
+          DrawTriangle(pts[0], pts[2], pts[1], {80,130,60,a});
+        }
+        },
+        .on_wall = [&](const iso::DrawItem& item) {
+            const auto* te = ed.catalog.get(item.tile.tile_id);
+            if (!te || !te->loaded) return;
+            float tw = te->src_width * zoom;
+            float th = te->src_height * zoom;
+            float screen_hh = cfg.tile_height * 0.5f * zoom;
+            unsigned char a = (unsigned char)(255 * item.alpha);
+            Rectangle src = {0, 0, (float)te->src_width, (float)te->src_height};
+            Rectangle dst = {item.screen_pos.x - tw * 0.5f,
+                            item.screen_pos.y + screen_hh - th, tw, th};
+            DrawTexturePro(te->texture, src, dst, {0,0}, 0.f, {255,255,255,a});
+        },
+        .on_object = [&](const iso::DrawItem& item) {
+            // Same as on_wall (bottom-center anchor)
+            const auto* te = ed.catalog.get(item.tile.tile_id);
+            if (!te || !te->loaded) return;
+            float tw = te->src_width * zoom;
+            float th = te->src_height * zoom;
+            float screen_hh = cfg.tile_height * 0.5f * zoom;
+            unsigned char a = (unsigned char)(255 * item.alpha);
+            Rectangle src = {0, 0, (float)te->src_width, (float)te->src_height};
+            Rectangle dst = {item.screen_pos.x - tw * 0.5f,
+                            item.screen_pos.y + screen_hh - th, tw, th};
+            DrawTexturePro(te->texture, src, dst, {0,0}, 0.f, {255,255,255,a});
+        },
+        .on_overlay = [&](const iso::DrawItem& item) {
+            // Same anchor as wall
+            const auto* te = ed.catalog.get(item.tile.tile_id);
+            if (!te || !te->loaded) return;
+            float tw = te->src_width * zoom;
+            float th = te->src_height * zoom;
+            float screen_hh = cfg.tile_height * 0.5f * zoom;
+            unsigned char a = (unsigned char)(255 * item.alpha);
+            Rectangle src = {0, 0, (float)te->src_width, (float)te->src_height};
+            Rectangle dst = {item.screen_pos.x - tw * 0.5f,
+                            item.screen_pos.y + screen_hh - th, tw, th};
+            DrawTexturePro(te->texture, src, dst, {0,0}, 0.f, {255,255,255,a});
+        },
+        .on_entity = [&](const iso::DrawItem& item) {
+            const auto* te = ed.catalog.get(item.entity->tile_id);
+            if (!te || !te->loaded) return;
+            float tw = te->src_width * zoom;
+            float th = te->src_height * zoom;
+            float screen_hh = cfg.tile_height * 0.5f * zoom;
+            unsigned char a = (unsigned char)(255 * item.alpha);
+            Rectangle src = {0, 0, (float)te->src_width, (float)te->src_height};
+            Rectangle dst = {item.screen_pos.x - tw * 0.5f,
+                            item.screen_pos.y + screen_hh - th, tw, th};
+            DrawTexturePro(te->texture, src, dst, {0,0}, 0.f, {255,255,255,a});
 
-                if (ent->id == ed.selected_entity_id) {
-                    DrawRectangleLinesEx(dst, 2.f, YELLOW);
-                    DrawText(TextFormat("z: %d", ent->z_bias),
-                        (int)dst.x, (int)dst.y - 16, 12, YELLOW);
-                }
+            if (item.entity->id == ed.selected_entity_id) {
+                DrawRectangleLinesEx(dst, 2.f, YELLOW);
+                DrawText(TextFormat("z: %d", item.entity->z_bias),
+                    (int)dst.x, (int)dst.y - 16, 12, YELLOW);
             }
         }
-    }
+        });
 
 
     // Grid — рисуем вокруг видимой области
-    if (ed.show_grid) {
-        iso::draw_tile_grid(ed.camera, cfg,
-            vis_col_min, vis_row_min, vis_col_max, vis_row_max,
-            ed.current_floor, { 60, 60, 80, 40 });
+    if (ed.show_grid) 
+    {
+        
+        iso::draw_tile_grid(ed.camera, cfg, va.col_min, va.row_min, va.col_max, va.row_max, ed.current_floor, { 60, 60, 80, 40 });
     }
 
     // Hover highlight
@@ -1311,7 +1212,8 @@ static void handle_file_drop(EditorState& ed) {
 
 // ─── Main ─────────────────────────────────────
 
-int main(int argc, char* argv[]) {
+int main(int argc, char* argv[]) 
+{
     // Window
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
     InitWindow(SCREEN_W, SCREEN_H, "iso_engine — Tile Map Editor");
@@ -1322,9 +1224,10 @@ int main(int argc, char* argv[]) {
 
     EditorState ed;
 
-    ed.config.tile_width       = 256;     // match your tileset dimensions!
-    ed.config.tile_height      = 128;
+    ed.config.tile_width       = 256 - ed.config.tile_padding;     // match your tileset dimensions!
+    ed.config.tile_height      = 128 - ed.config.tile_padding;
     ed.config.floor_height     = 1.0f;
+
     ed.config.height_pixel_offset = 30.0f;
     ed.config.default_map_cols = 32;
     ed.config.default_map_rows = 32;

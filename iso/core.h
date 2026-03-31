@@ -75,7 +75,7 @@ struct IsoConfig {
     float height_pixel_offset = 30.0f;  // screen pixels per floor level (vertical shift)
 
     // Rendering
-    float tile_padding  = 0.0f;  // extra pixels added to tile size to prevent seams at fractional zoom
+    float tile_padding  = 2.0f;  // extra pixels added to tile size to prevent seams at fractional zoom
     bool  pixel_snap    = true;  // snap tile screen positions to integer pixels
 
     // Map limits (for default map allocation; 0 = dynamic)

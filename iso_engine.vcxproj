@@ -159,6 +159,8 @@
     <ClInclude Include="iso\iso_raylib.h" />
     <ClInclude Include="iso\map.h" />
     <ClInclude Include="iso\map_format.h" />
+    <ClInclude Include="iso\renderer.h" />
+    <ClInclude Include="iso\tile_collision.h" />
     <ClInclude Include="iso\zsort.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

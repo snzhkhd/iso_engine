@@ -4,6 +4,7 @@
 // ────────────────────────────────────────
 
 #include "iso.h"
+#include "raylib.h"
 
 // Check that raylib is available
 #ifndef RAYLIB_H

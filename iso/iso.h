@@ -20,6 +20,7 @@
 #include "collision.h"
 #include "zsort.h"
 #include "camera.h"
+
 #include "map_format.h"
 
 namespace iso {

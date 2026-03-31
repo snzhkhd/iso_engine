@@ -68,5 +68,11 @@
     <ClInclude Include="iso\map_format.h">
       <Filter>Файлы заголовков\iso_engine</Filter>
     </ClInclude>
+    <ClInclude Include="iso\renderer.h">
+      <Filter>Файлы заголовков\iso_engine</Filter>
+    </ClInclude>
+    <ClInclude Include="iso\tile_collision.h">
+      <Filter>Файлы заголовков\iso_engine</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>
